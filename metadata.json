@@ -1,0 +1,8 @@
+{
+  "name": "DIPSI Tamantri - Deteksi Perundungan Sejak Dini",
+  "description": "Aplikasi web interaktif ramah anak untuk deteksi perundungan sejak dini, curhat aman berbasis AI, edukasi anti-perundungan, dan manajemen tindak lanjut TPPK di SDN Kotalama 3.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
