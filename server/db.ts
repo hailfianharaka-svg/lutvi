@@ -13,6 +13,7 @@ import {
   DEFAULT_DIPSY_IMAGE,
   DEFAULT_MEADOW_IMAGE,
   FollowUpStatus,
+  SheetDbConfig,
 } from '../src/types';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
@@ -320,6 +321,62 @@ export function updateSettings(partial: Partial<AppSettings>): AppSettings {
     upsert.run('tppkPhone', partial.tppkPhone.trim());
   }
   return getSettings();
+}
+
+export function getSheetDbConfig(): SheetDbConfig {
+  const rows = db.prepare('SELECT key, value FROM settings').all() as {
+    key: string;
+    value: string;
+  }[];
+  const map = new Map(rows.map((r) => [r.key, r.value]));
+  return {
+    linkedSpreadsheetId: map.get('linkedSpreadsheetId') || '',
+    linkedSpreadsheetUrl: map.get('linkedSpreadsheetUrl') || '',
+    linkedSpreadsheetTitle: map.get('linkedSpreadsheetTitle') || '',
+    autoSync: map.get('sheetsAutoSync') !== 'false',
+    dbInitialized: map.get('sheetsDbInitialized') === 'true',
+    lastSyncAt: map.get('sheetsLastSyncAt') || '',
+  };
+}
+
+export function updateSheetDbConfig(partial: Partial<SheetDbConfig>): SheetDbConfig {
+  const upsert = db.prepare(
+    `INSERT INTO settings (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+  );
+  if (partial.linkedSpreadsheetId !== undefined) {
+    upsert.run('linkedSpreadsheetId', partial.linkedSpreadsheetId);
+  }
+  if (partial.linkedSpreadsheetUrl !== undefined) {
+    upsert.run('linkedSpreadsheetUrl', partial.linkedSpreadsheetUrl);
+  }
+  if (partial.linkedSpreadsheetTitle !== undefined) {
+    upsert.run('linkedSpreadsheetTitle', partial.linkedSpreadsheetTitle);
+  }
+  if (partial.autoSync !== undefined) {
+    upsert.run('sheetsAutoSync', partial.autoSync ? 'true' : 'false');
+  }
+  if (partial.dbInitialized !== undefined) {
+    upsert.run('sheetsDbInitialized', partial.dbInitialized ? 'true' : 'false');
+  }
+  if (partial.lastSyncAt !== undefined) {
+    upsert.run('sheetsLastSyncAt', partial.lastSyncAt);
+  }
+  return getSheetDbConfig();
+}
+
+export function clearSheetDbConfig(): SheetDbConfig {
+  db.prepare(
+    `DELETE FROM settings WHERE key IN (
+      'linkedSpreadsheetId',
+      'linkedSpreadsheetUrl',
+      'linkedSpreadsheetTitle',
+      'sheetsAutoSync',
+      'sheetsDbInitialized',
+      'sheetsLastSyncAt'
+    )`
+  ).run();
+  return getSheetDbConfig();
 }
 
 export function createCounselingSession(

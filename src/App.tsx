@@ -109,12 +109,8 @@ export default function App() {
           <p className="font-medium text-slate-700">
             DIPSI Tamantri · Deteksi Perundungan Sejak Dini · {settings.schoolName}
           </p>
-          <p>
-            Ketua Tim TPPK: <strong className="text-emerald-900">{settings.tppkChairName}</strong>{' '}
-            · HP/WA:{' '}
-            <span className="font-mono tabular-nums font-semibold text-emerald-900">
-              {settings.tppkPhone}
-            </span>
+          <p className="font-medium text-slate-700">
+            Created by: <strong className="text-emerald-900">Lutvi Awan Amin</strong>. 2026.
           </p>
         </div>
       </footer>

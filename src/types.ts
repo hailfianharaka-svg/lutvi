@@ -90,6 +90,34 @@ export interface AdminStats {
   moodCounts: Record<MoodType, number>;
 }
 
+export interface SheetDbConfig {
+  linkedSpreadsheetId: string;
+  linkedSpreadsheetUrl: string;
+  linkedSpreadsheetTitle: string;
+  autoSync: boolean;
+  dbInitialized: boolean;
+  lastSyncAt: string;
+}
+
+export interface SheetInspectResult {
+  spreadsheetId: string;
+  spreadsheetUrl: string;
+  title: string;
+  existingTabs: string[];
+  requiredTabs: string[];
+  missingTabs: string[];
+}
+
+export interface SheetSyncResult {
+  spreadsheetId: string;
+  spreadsheetTitle: string;
+  createdTabs: string[];
+  syncedReportsCount: number;
+  syncedMessagesCount: number;
+  pulledUpdatesCount: number;
+  lastSyncAt: string;
+}
+
 export const MOOD_OPTIONS: {
   value: MoodType;
   label: string;
@@ -130,4 +158,4 @@ export const ADMIN_ROLES: AdminRole[] = [
 
 export const DEFAULT_DIPSY_IMAGE = '/src/assets/images/dipsy_mascot_1794707527030.jpg';
 export const DEFAULT_MEADOW_IMAGE = '/src/assets/images/meadow_backdrop_1794707527120.jpg';
-export const EDU_SCHOOL_IMAGE = '/src/assets/images/edu_safe_school_clean_1794707543484.jpg';
+export const EDU_SCHOOL_IMAGE = '/src/assets/images/edu_sd_muslim_merah_putih_1794881255247.jpg';

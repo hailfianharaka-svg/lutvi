@@ -1,7 +1,9 @@
-import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { ChangeEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { User } from 'firebase/auth';
 import {
   AlertTriangle,
   CheckCircle2,
+  Database,
   Download,
   Eye,
   EyeOff,
@@ -33,20 +35,38 @@ import {
   FOLLOW_UP_STATUSES,
   FollowUpStatus,
   MOOD_OPTIONS,
+  SheetDbConfig,
+  SheetSyncResult,
 } from '../types';
+import {
+  clearCachedGoogleToken,
+  googleSheetsSignIn,
+  googleSheetsSignOut,
+  initGoogleAuth,
+} from '../lib/googleSheetsAuth';
 import { computeAdminStats } from '../utils/counselingLogic';
 import { exportToExcelHtml, exportToWordDoc, printPdfReport } from '../utils/exportReports';
 import { DipsyAvatar } from './DipsyAvatar';
 import { PrintableReport } from './PrintableReport';
+import { SpreadsheetDatabaseTab } from './SpreadsheetDatabaseTab';
 
 interface AdminDashboardViewProps {
   settings: AppSettings;
   onSettingsUpdated: (updated: AppSettings) => void;
 }
 
-type AdminTab = 'rekap' | 'users' | 'tampilan';
+type AdminTab = 'rekap' | 'database' | 'users' | 'tampilan';
 
 const TOKEN_STORAGE_KEY = 'dipsi_tamantri_admin_token';
+
+const EMPTY_SHEET_CONFIG: SheetDbConfig = {
+  linkedSpreadsheetId: '',
+  linkedSpreadsheetUrl: '',
+  linkedSpreadsheetTitle: '',
+  autoSync: true,
+  dbInitialized: false,
+  lastSyncAt: '',
+};
 
 function statusTone(status: FollowUpStatus): string {
   switch (status) {
@@ -135,6 +155,16 @@ export function AdminDashboardView({
   const [settingsMsg, setSettingsMsg] = useState('');
   const [isSavingSettings, setIsSavingSettings] = useState(false);
 
+  // Google Sheets realtime database state (access token kept in memory only)
+  const [googleUser, setGoogleUser] = useState<User | null>(null);
+  const [googleToken, setGoogleToken] = useState<string | null>(null);
+  const [isSigningInGoogle, setIsSigningInGoogle] = useState(false);
+  const [sheetConfig, setSheetConfig] = useState<SheetDbConfig>(EMPTY_SHEET_CONFIG);
+  const [isSyncingSheets, setIsSyncingSheets] = useState(false);
+  const [lastSyncResult, setLastSyncResult] = useState<SheetSyncResult | null>(null);
+  const [sheetsError, setSheetsError] = useState('');
+  const syncInFlightRef = useRef(false);
+
   useEffect(() => {
     setDipsyInput(settings.dipsyImageUrl);
     setMeadowInput(settings.meadowImageUrl);
@@ -142,13 +172,27 @@ export function AdminDashboardView({
     setTppkPhoneInput(settings.tppkPhone);
   }, [settings]);
 
+  useEffect(() => {
+    const unsubscribe = initGoogleAuth(
+      (user, accessToken) => {
+        setGoogleUser(user);
+        setGoogleToken(accessToken);
+      },
+      () => {
+        setGoogleToken(null);
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
   const fetchDashboardData = useCallback(async (authToken: string) => {
     setLoadingData(true);
     try {
       const headers = { Authorization: `Bearer ${authToken}` };
-      const [repRes, userRes] = await Promise.all([
+      const [repRes, userRes, sheetRes] = await Promise.all([
         fetch('/api/admin/reports', { headers }),
         fetch('/api/admin/users', { headers }),
+        fetch('/api/admin/sheets/config', { headers }),
       ]);
       if (repRes.status === 401) {
         localStorage.removeItem(TOKEN_STORAGE_KEY);
@@ -165,10 +209,127 @@ export function AdminDashboardView({
         const userData = await userRes.json();
         setAdminList(userData.users || []);
       }
+      if (sheetRes.ok) {
+        const sheetData = await sheetRes.json();
+        if (sheetData.config) {
+          setSheetConfig(sheetData.config);
+        }
+      }
     } finally {
       setLoadingData(false);
     }
   }, []);
+
+  const syncWithSpreadsheet = useCallback(
+    async (allowPullFromSheet: boolean): Promise<boolean> => {
+      if (!token || !googleToken || !sheetConfig.linkedSpreadsheetId) return false;
+      if (syncInFlightRef.current) return false;
+
+      syncInFlightRef.current = true;
+      setIsSyncingSheets(true);
+      setSheetsError('');
+      try {
+        const res = await fetch('/api/admin/sheets/sync', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+            'X-Google-Access-Token': googleToken,
+          },
+          body: JSON.stringify({ allowPullFromSheet }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          if (res.status === 401) {
+            clearCachedGoogleToken();
+            setGoogleToken(null);
+          }
+          setSheetsError(data.error || 'Gagal menyinkronkan Google Spreadsheet.');
+          return false;
+        }
+        if (data.config) setSheetConfig(data.config);
+        if (data.result) setLastSyncResult(data.result);
+        if (data.reports) setReports(data.reports);
+        if (data.stats) setStats(data.stats);
+        return true;
+      } catch {
+        setSheetsError('Koneksi ke Google Spreadsheet terganggu.');
+        return false;
+      } finally {
+        syncInFlightRef.current = false;
+        setIsSyncingSheets(false);
+      }
+    },
+    [token, googleToken, sheetConfig.linkedSpreadsheetId]
+  );
+
+  // Realtime SSE subscription for live dashboard & automatic Google Sheets push
+  useEffect(() => {
+    if (!token || !adminUser) return;
+    const controller = new AbortController();
+
+    (async () => {
+      try {
+        const res = await fetch('/api/admin/events', {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: controller.signal,
+        });
+        if (!res.ok || !res.body) return;
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split('\n\n');
+          buffer = frames.pop() ?? '';
+
+          for (const frame of frames) {
+            if (frame.includes('event: reports_updated') || frame.includes('event: settings_updated')) {
+              await fetchDashboardData(token);
+              if (sheetConfig.linkedSpreadsheetId && sheetConfig.autoSync && googleToken) {
+                await syncWithSpreadsheet(false);
+              }
+            }
+          }
+        }
+      } catch {
+        // Connection closed or aborted on unmount
+      }
+    })();
+
+    return () => controller.abort();
+  }, [
+    token,
+    adminUser,
+    fetchDashboardData,
+    sheetConfig.linkedSpreadsheetId,
+    sheetConfig.autoSync,
+    googleToken,
+    syncWithSpreadsheet,
+  ]);
+
+  // Periodic two-way realtime sync every 12 seconds when linked & active
+  useEffect(() => {
+    if (!token || !adminUser || !googleToken) return;
+    if (!sheetConfig.linkedSpreadsheetId || !sheetConfig.autoSync) return;
+
+    const timer = window.setInterval(() => {
+      syncWithSpreadsheet(true);
+    }, 12000);
+
+    return () => window.clearInterval(timer);
+  }, [
+    token,
+    adminUser,
+    googleToken,
+    sheetConfig.linkedSpreadsheetId,
+    sheetConfig.autoSync,
+    syncWithSpreadsheet,
+  ]);
 
   useEffect(() => {
     if (!token) {
@@ -291,10 +452,150 @@ export function AdminDashboardView({
       if (data.stats) setStats(data.stats);
       setSelectedReport(data.report);
       setProgressFeedback('Progress tindak lanjut dan catatan TPPK berhasil disimpan.');
+      if (sheetConfig.linkedSpreadsheetId && sheetConfig.autoSync && googleToken) {
+        syncWithSpreadsheet(false);
+      }
     } catch {
       setProgressFeedback('Gagal menghubungi server.');
     } finally {
       setIsSavingProgress(false);
+    }
+  }
+
+  async function handleGoogleSignIn() {
+    setIsSigningInGoogle(true);
+    setSheetsError('');
+    try {
+      const res = await googleSheetsSignIn();
+      setGoogleUser(res.user);
+      setGoogleToken(res.accessToken);
+    } catch (err) {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : 'Login Google dibatalkan atau gagal memperoleh akses Google Sheets.';
+      setSheetsError(msg);
+    } finally {
+      setIsSigningInGoogle(false);
+    }
+  }
+
+  async function handleGoogleSignOut() {
+    await googleSheetsSignOut();
+    setGoogleUser(null);
+    setGoogleToken(null);
+  }
+
+  async function handleProvisionExistingSpreadsheet(
+    urlOrId: string,
+    autoSync: boolean
+  ): Promise<boolean> {
+    if (!token || !googleToken) return false;
+    setIsSyncingSheets(true);
+    setSheetsError('');
+    try {
+      const res = await fetch('/api/admin/sheets/provision', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+          'X-Google-Access-Token': googleToken,
+        },
+        body: JSON.stringify({ urlOrId, autoSync }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (res.status === 401) {
+          clearCachedGoogleToken();
+          setGoogleToken(null);
+        }
+        setSheetsError(data.error || 'Gagal membuat struktur database Spreadsheet.');
+        return false;
+      }
+      if (data.config) setSheetConfig(data.config);
+      if (data.result) setLastSyncResult(data.result);
+      return true;
+    } catch {
+      setSheetsError('Gagal terhubung ke server saat membuat database.');
+      return false;
+    } finally {
+      setIsSyncingSheets(false);
+    }
+  }
+
+  async function handleCreateNewSpreadsheet(
+    title: string,
+    autoSync: boolean
+  ): Promise<boolean> {
+    if (!token || !googleToken) return false;
+    setIsSyncingSheets(true);
+    setSheetsError('');
+    try {
+      const res = await fetch('/api/admin/sheets/create', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+          'X-Google-Access-Token': googleToken,
+        },
+        body: JSON.stringify({ title, autoSync }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (res.status === 401) {
+          clearCachedGoogleToken();
+          setGoogleToken(null);
+        }
+        setSheetsError(data.error || 'Gagal membuat Google Spreadsheet baru.');
+        return false;
+      }
+      if (data.config) setSheetConfig(data.config);
+      if (data.result) setLastSyncResult(data.result);
+      return true;
+    } catch {
+      setSheetsError('Gagal terhubung ke server saat membuat Spreadsheet.');
+      return false;
+    } finally {
+      setIsSyncingSheets(false);
+    }
+  }
+
+  async function handleToggleAutoSync(nextAutoSync: boolean) {
+    if (!token) return;
+    setSheetsError('');
+    try {
+      const res = await fetch('/api/admin/sheets/config', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ autoSync: nextAutoSync }),
+      });
+      const data = await res.json();
+      if (res.ok && data.config) {
+        setSheetConfig(data.config);
+      }
+    } catch {
+      setSheetsError('Gagal mengubah pengaturan Auto-Sync.');
+    }
+  }
+
+  async function handleUnlinkSpreadsheet() {
+    if (!token) return;
+    setSheetsError('');
+    try {
+      const res = await fetch('/api/admin/sheets/unlink', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setSheetConfig(data.config || EMPTY_SHEET_CONFIG);
+        setLastSyncResult(null);
+      }
+    } catch {
+      setSheetsError('Gagal memutuskan tautan Spreadsheet.');
     }
   }
 
@@ -567,8 +868,8 @@ export function AdminDashboardView({
             </p>
           </div>
 
-          <div className="flex flex-wrap lg:flex-nowrap items-center gap-2.5 shrink-0">
-            <div className="inline-flex items-center gap-1 p-1 bg-slate-100 rounded-xl">
+          <div className="flex flex-wrap xl:flex-nowrap items-center gap-2.5 shrink-0">
+            <div className="inline-flex flex-wrap sm:flex-nowrap items-center gap-1 p-1 bg-slate-100 rounded-xl">
               <button
                 type="button"
                 onClick={() => setActiveTab('rekap')}
@@ -580,6 +881,18 @@ export function AdminDashboardView({
               >
                 <FileText className="w-3.5 h-3.5" aria-hidden="true" />
                 <span>Statistik &amp; Rekap</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab('database')}
+                className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors cursor-pointer ${
+                  activeTab === 'database'
+                    ? 'bg-white text-emerald-950 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Database className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>Database Spreadsheet</span>
               </button>
               <button
                 type="button"
@@ -738,8 +1051,22 @@ export function AdminDashboardView({
                   </p>
                 </div>
 
-                {/* Export Buttons */}
+                {/* Export & Spreadsheet Sync Buttons */}
                 <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('database')}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-emerald-300 bg-emerald-50 hover:bg-emerald-100 text-xs font-semibold text-emerald-950 whitespace-nowrap cursor-pointer"
+                  >
+                    <Database className="w-3.5 h-3.5 text-emerald-700" aria-hidden="true" />
+                    <span>
+                      {sheetConfig.linkedSpreadsheetId
+                        ? googleToken && sheetConfig.autoSync
+                          ? 'Spreadsheet: Live'
+                          : 'Kelola Spreadsheet'
+                        : 'Tautkan Google Spreadsheet'}
+                    </span>
+                  </button>
                   <button
                     type="button"
                     onClick={printPdfReport}
@@ -914,6 +1241,28 @@ export function AdminDashboardView({
               </div>
             </div>
           </div>
+        )}
+
+        {activeTab === 'database' && (
+          <SpreadsheetDatabaseTab
+            adminToken={token}
+            googleUser={googleUser}
+            googleToken={googleToken}
+            isSigningInGoogle={isSigningInGoogle}
+            onGoogleSignIn={handleGoogleSignIn}
+            onGoogleSignOut={handleGoogleSignOut}
+            sheetConfig={sheetConfig}
+            isSyncing={isSyncingSheets}
+            lastSyncResult={lastSyncResult}
+            sheetsError={sheetsError}
+            reports={reports}
+            onProvisionExisting={handleProvisionExistingSpreadsheet}
+            onCreateNewSpreadsheet={handleCreateNewSpreadsheet}
+            onSyncNow={() => syncWithSpreadsheet(true)}
+            onToggleAutoSync={handleToggleAutoSync}
+            onUnlinkSpreadsheet={handleUnlinkSpreadsheet}
+            onClearError={() => setSheetsError('')}
+          />
         )}
 
         {activeTab === 'users' && (

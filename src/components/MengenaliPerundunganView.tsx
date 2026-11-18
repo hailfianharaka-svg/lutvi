@@ -86,7 +86,7 @@ export function MengenaliPerundunganView({
             {!imgFailed ? (
               <img
                 src={EDU_SCHOOL_IMAGE}
-                alt="Ilustrasi anak-anak sekolah dasar bermain rukun bersama di halaman sekolah yang aman"
+                alt="Ilustrasi anak muslim dan muslimah berseragam merah putih SD bermain dan saling membantu dengan rukun di halaman sekolah"
                 referrerPolicy="no-referrer"
                 onError={() => setImgFailed(true)}
                 className="w-full h-full object-cover"
